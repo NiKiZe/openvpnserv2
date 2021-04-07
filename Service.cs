@@ -69,25 +69,28 @@ namespace OpenVpn
         {
             try
             {
-                List<RegistryKey> rkOvpns = new List<RegistryKey>();
-
                 // Search 64-bit registry, then 32-bit registry for OpenVpn
-                var key = GetRegistrySubkey(RegistryView.Registry64);
-                if (key != null) rkOvpns.Add(key);
-                key = GetRegistrySubkey(RegistryView.Registry32);
-                if (key != null) rkOvpns.Add(key);
-
-                if (rkOvpns.Count() == 0)
-                    throw new Exception("Registry key missing");
+                var rkOvpns = (new[] { RegistryView.Registry64, RegistryView.Registry32 })
+                    .Select(GetRegistrySubkey)
+                    .Where(k => k != null).ToList();
 
                 var configDirsConsidered = new HashSet<string>();
 
-                foreach (var rkOvpn in rkOvpns)
+                // fallback values for any missing registry value - built by checking relative path to exe
+                var applicationPath = System.Reflection.Assembly.GetExecutingAssembly().Location; // x\bin\OpenVpnServ2.exe
+                var baseBinPath = Path.GetDirectoryName(applicationPath); // x\bin
+                var fallbackExePath = Path.Combine(baseBinPath, "openvpn.exe"); // x\bin\openvpn.exe
+                var basePath = Path.GetDirectoryName(baseBinPath); // x
+                var fallbackConfigDir = Path.Combine(basePath, "config-auto"); // x\config-auto
+                var fallbackLogDir = Path.Combine(basePath, "log"); // x\log
+
+                var configs = rkOvpns.Select(rkOvpn =>
                 {
-                    try {
+                    try
+                    {
                         bool append = false;
                         {
-                            var logAppend = (string)rkOvpn.GetValue("log_append");
+                            var logAppend = (string)rkOvpn.GetValue("log_append", "0");
                             if (logAppend[0] == '0' || logAppend[0] == '1')
                                 append = logAppend[0] == '1';
                             else
@@ -96,21 +99,53 @@ namespace OpenVpn
 
                         var config = new OpenVpnServiceConfiguration()
                         {
-                            exePath = (string)rkOvpn.GetValue("exe_path"),
-                            configDir = (string)rkOvpn.GetValue("autostart_config_dir"),
-                            configExt = "." + (string)rkOvpn.GetValue("config_ext"),
-                            logDir = (string)rkOvpn.GetValue("log_dir"),
+                            exePath = (string)rkOvpn.GetValue("exe_path", fallbackExePath),
+                            configDir = (string)rkOvpn.GetValue("autostart_config_dir", fallbackConfigDir),
+                            configExt = "." + (string)rkOvpn.GetValue("config_ext", "ovpn"),
+                            logDir = (string)rkOvpn.GetValue("log_dir", fallbackLogDir),
                             logAppend = append,
-                            priorityClass = GetPriorityClass((string)rkOvpn.GetValue("priority")),
+                            priorityClass = GetPriorityClass((string)rkOvpn.GetValue("priority", "NORMAL_PRIORITY_CLASS")),
 
                             eventLog = EventLog,
                         };
 
-                        if (String.IsNullOrEmpty(config.configDir) || configDirsConsidered.Contains(config.configDir)) {
-                            continue;
+                        if (String.IsNullOrEmpty(config.configDir) || configDirsConsidered.Contains(config.configDir))
+                        {
+                            return null; // continue
                         }
                         configDirsConsidered.Add(config.configDir);
+                        return config;
+                    }
+                    catch (NullReferenceException e) /* e.g. missing registry values */
+                    {
+                        EventLog.WriteEntry("Registry values are incomplete for " + rkOvpn.View.ToString() + e);
+                        return null;
+                    }
+                })
+                .Where(k => k != null).ToList();
 
+                // fallback config if no registry value exist
+                if (configs.Count == 0)
+                {
+                    EventLog.WriteEntry("Registry config missing, using fallback settings");
+                    var config = new OpenVpnServiceConfiguration()
+                    {
+                        exePath = fallbackExePath,
+                        configDir = fallbackConfigDir,
+                        configExt = ".ovpn",
+                        logDir = fallbackLogDir,
+                        logAppend = false,
+                        priorityClass = ProcessPriorityClass.Normal,
+
+                        eventLog = EventLog,
+                    };
+                    configs.Add(config);
+                }
+
+                foreach (var config in configs)
+                {
+                    try
+                    {
                         /// Only attempt to start the service
                         /// if openvpn.exe is present. This should help if there are old files
                         /// and registry settings left behind from a previous OpenVPN 32-bit installation
@@ -139,15 +174,15 @@ namespace OpenVpn
                     }
                     catch (NullReferenceException e) /* e.g. missing registry values */
                     {
-                        EventLog.WriteEntry("Registry values are incomplete for " + rkOvpn.View.ToString() + e.StackTrace);
+                        EventLog.WriteEntry("Registry values are incomplete for " + e);
                     }
                 }
 
             }
             catch (Exception e)
             {
-                EventLog.WriteEntry("Exception occured during OpenVPN service start: " + e.Message + e.StackTrace);
-                throw e;
+                EventLog.WriteEntry("Exception occured during OpenVPN service start: " + e);
+                throw;
             }
         }
 
